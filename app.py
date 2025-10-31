@@ -1,5 +1,5 @@
 from flask import Flask, jsonify
-from supabase import create_client, Client, ClientOptions
+from supabase import create_client, Client
 import os
 
 app = Flask(__name__)
@@ -10,8 +10,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Initialisation de Supabase
 try:
-    options = ClientOptions()  # ✅ objet d’options vide compatible
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     print("[OK] Supabase initialized successfully")
 except Exception as e:
     print(f"[ERROR] Supabase initialization failed: {e}")
