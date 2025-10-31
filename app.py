@@ -29,7 +29,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     logger.error("[ERROR] SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
 else:
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY, options={})
         logger.info("[INFO] Supabase connection established successfully")
     except Exception as e:
         logger.error(f"[ERROR] Supabase initialization failed: {e}")
