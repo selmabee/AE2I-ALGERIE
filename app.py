@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 import logging
 
-# Configuration du logging
+# Configuraton du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -21,8 +21,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @app.route('/')
 def index():
-    """Route principale - Affiche index.html"""
-    return send_from_directory('public', 'index.html')
+    """Affiche la page principale"""
+    return send_from_directory('.', 'index.html')
 
 @app.route('/health')
 def health():
