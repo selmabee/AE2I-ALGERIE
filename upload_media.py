@@ -1,236 +1,427 @@
 """
-Netlify Function: Upload Media
-FIX: secure-file-upload
-ADD: upload-media-endpoint
-ADD: file-validation-security
-
-Permet le téléversement sécurisé de fichiers (images, vidéos, documents, CV)
-avec validation stricte du type MIME et de la taille.
+Module de gestion d'uploads pour AE2I
+Blueprint Flask autonome avec intégration Supabase Storage
 """
 
-import json
 import os
-import base64
-import mimetypes
+import uuid
+import logging
 from datetime import datetime
-from pathlib import Path
-from urllib.parse import parse_qs
+from typing import List, Tuple
+from werkzeug.utils import secure_filename
+from flask import Blueprint, request, jsonify
+from supabase import create_client, Client
 
-# Configuration
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
-ALLOWED_MIME_TYPES = [
-    'image/jpeg',
-    'image/jpg',
-    'image/png',
-    'image/webp',
-    'video/mp4',
-    'video/quicktime',
-    'application/pdf'
-]
-ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.mp4', '.mov', '.pdf']
-FORBIDDEN_EXTENSIONS = ['.exe', '.bat', '.sh', '.cmd', '.com', '.scr', '.js', '.jar']
-UPLOADS_DIR = '/tmp/uploads'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://uisxrkzkqtbapnxnyuod.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVpc3hya3prcXRiYXBueG55dW9kIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE5MDA0MTksImV4cCI6MjA3NzQ3NjQxOX0.lySWXQnIUDdCtrYVRrgoBMCIKWsKuqN8b-ipl3qSDwg")
+BUCKET_NAME = "ae2i-files"
+
+MAX_FILE_SIZE = 50 * 1024 * 1024
+FORBIDDEN_EXTENSIONS = {'.exe', '.bat', '.js', '.php', '.sh'}
+ALLOWED_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.webp',
+    '.mp4', '.mov', '.avi', '.mkv',
+    '.pdf', '.docx', '.xlsx', '.pptx', '.zip', '.rar'
+}
+
+CATEGORY_MAP = {
+    'image/jpeg': 'images',
+    'image/jpg': 'images',
+    'image/png': 'images',
+    'image/gif': 'images',
+    'image/webp': 'images',
+    'video/mp4': 'videos',
+    'video/quicktime': 'videos',
+    'video/x-msvideo': 'videos',
+    'video/x-matroska': 'videos',
+    'application/pdf': 'pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'documents',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'documents',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'documents',
+    'application/zip': 'documents',
+    'application/x-rar-compressed': 'documents',
+}
+
+upload_bp = Blueprint('upload', __name__)
+
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logger.info("Connexion Supabase établie avec succès")
+except Exception as e:
+    logger.error(f"Erreur de connexion Supabase: {str(e)}")
+    supabase = None
 
 
-def handler(event, context):
+def ensure_bucket_exists():
     """
-    Handler principal pour le téléversement de fichiers
+    Vérifie et crée le bucket ae2i-files s'il n'existe pas
     """
-
-    # Vérifier la méthode HTTP
-    if event['httpMethod'] != 'POST':
-        return {
-            'statusCode': 405,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-            },
-            'body': json.dumps({
-                'status': 'error',
-                'message': 'Method not allowed. Use POST.'
-            })
-        }
-
-    # Gérer les requêtes OPTIONS (CORS preflight)
-    if event['httpMethod'] == 'OPTIONS':
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-            },
-            'body': ''
-        }
-
     try:
-        # Créer le dossier uploads s'il n'existe pas
-        os.makedirs(UPLOADS_DIR, exist_ok=True)
+        buckets = supabase.storage.list_buckets()
+        bucket_names = [bucket.name for bucket in buckets]
 
-        # Parser le body (multipart/form-data)
-        content_type = event.get('headers', {}).get('content-type', '')
-
-        if 'multipart/form-data' not in content_type:
-            return error_response(
-                400,
-                'Invalid content type. Use multipart/form-data.'
+        if BUCKET_NAME not in bucket_names:
+            logger.info(f"Création du bucket {BUCKET_NAME}")
+            supabase.storage.create_bucket(
+                BUCKET_NAME,
+                options={"public": True}
             )
+            logger.info(f"Bucket {BUCKET_NAME} créé avec succès")
+        return True
+    except Exception as e:
+        logger.error(f"Erreur lors de la vérification/création du bucket: {str(e)}")
+        return False
 
-        # Extraire le boundary
-        boundary = None
-        for part in content_type.split(';'):
-            if 'boundary=' in part:
-                boundary = part.split('boundary=')[1].strip()
-                break
 
-        if not boundary:
-            return error_response(400, 'No boundary found in content-type.')
+def validate_file(file) -> Tuple[bool, str]:
+    """
+    Valide un fichier uploadé
+    Returns: (is_valid, error_message)
+    """
+    if not file:
+        return False, "Aucun fichier fourni"
 
-        # Décoder le body (base64 si isBase64Encoded=True)
-        body = event.get('body', '')
-        if event.get('isBase64Encoded', False):
-            body = base64.b64decode(body).decode('latin-1')
+    if file.filename == '':
+        return False, "Nom de fichier vide"
 
-        # Parser les parties du multipart
-        parts = body.split('--' + boundary)
+    file_ext = os.path.splitext(file.filename)[1].lower()
 
-        file_data = None
-        filename = None
-        content_type_file = None
+    if file_ext in FORBIDDEN_EXTENSIONS:
+        return False, f"Extension interdite: {file_ext}"
 
-        for part in parts:
-            if 'Content-Disposition' in part and 'filename=' in part:
-                # Extraire les headers et le contenu
-                headers_end = part.find('\r\n\r\n')
-                if headers_end == -1:
-                    headers_end = part.find('\n\n')
+    if file_ext not in ALLOWED_EXTENSIONS:
+        return False, f"Extension non autorisée: {file_ext}"
 
-                if headers_end == -1:
-                    continue
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
 
-                headers_section = part[:headers_end]
-                file_content = part[headers_end + 4:]  # +4 pour sauter \r\n\r\n
+    if file_size > MAX_FILE_SIZE:
+        return False, f"Fichier trop volumineux (max 50 Mo)"
 
-                # Extraire le filename
-                for line in headers_section.split('\n'):
-                    if 'filename=' in line:
-                        filename_part = line.split('filename=')[1]
-                        filename = filename_part.strip().strip('"').strip("'")
-                        filename = filename.split('\r')[0].split('\n')[0]
+    if file_size == 0:
+        return False, "Fichier vide"
 
-                    if 'Content-Type:' in line:
-                        content_type_file = line.split('Content-Type:')[1].strip()
+    return True, ""
 
-                # Nettoyer le contenu (enlever les \r\n finaux)
-                if file_content.endswith('\r\n'):
-                    file_content = file_content[:-2]
-                elif file_content.endswith('\n'):
-                    file_content = file_content[:-1]
 
-                file_data = file_content.encode('latin-1')
-                break
+def get_category(mime_type: str, custom_category: str = None) -> str:
+    """
+    Détermine la catégorie d'un fichier
+    """
+    if custom_category:
+        return custom_category
 
-        # Valider que le fichier a été trouvé
-        if not file_data or not filename:
-            return error_response(400, 'No file found in request.')
+    return CATEGORY_MAP.get(mime_type, 'documents')
 
-        # Valider l'extension
-        file_ext = os.path.splitext(filename)[1].lower()
 
-        if file_ext in FORBIDDEN_EXTENSIONS:
-            return error_response(
-                400,
-                f'Forbidden file type: {file_ext}. Executable files are not allowed.'
-            )
+def generate_unique_filename(original_filename: str) -> str:
+    """
+    Génère un nom de fichier unique avec UUID et timestamp
+    """
+    file_ext = os.path.splitext(original_filename)[1].lower()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    unique_id = str(uuid.uuid4())[:8]
+    return f"{timestamp}_{unique_id}{file_ext}"
 
-        if file_ext not in ALLOWED_EXTENSIONS:
-            return error_response(
-                400,
-                f'Invalid file extension: {file_ext}. Allowed: {", ".join(ALLOWED_EXTENSIONS)}'
-            )
 
-        # Valider le MIME type
-        if content_type_file and content_type_file not in ALLOWED_MIME_TYPES:
-            return error_response(
-                400,
-                f'Invalid MIME type: {content_type_file}. Allowed: {", ".join(ALLOWED_MIME_TYPES)}'
-            )
+def upload_to_supabase(file, category: str) -> dict:
+    """
+    Upload un fichier vers Supabase Storage et log dans la base
+    """
+    try:
+        is_valid, error_msg = validate_file(file)
+        if not is_valid:
+            return {
+                "success": False,
+                "error": error_msg
+            }
 
-        # Valider la taille
-        file_size = len(file_data)
-        if file_size > MAX_FILE_SIZE:
-            return error_response(
-                400,
-                f'File too large: {file_size} bytes. Max: {MAX_FILE_SIZE} bytes (20 MB).'
-            )
+        if not ensure_bucket_exists():
+            return {
+                "success": False,
+                "error": "Impossible de vérifier/créer le bucket"
+            }
 
-        if file_size == 0:
-            return error_response(400, 'Empty file.')
+        original_filename = secure_filename(file.filename)
+        unique_filename = generate_unique_filename(original_filename)
+        mime_type = file.content_type or 'application/octet-stream'
+        category = get_category(mime_type, category)
 
-        # Générer un nom unique
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        safe_filename = ''.join(c for c in filename if c.isalnum() or c in '._- ')
-        unique_filename = f"{timestamp}_{safe_filename}"
+        storage_path = f"{category}/{unique_filename}"
 
-        # Sauvegarder le fichier
-        file_path = os.path.join(UPLOADS_DIR, unique_filename)
+        file.seek(0)
+        file_content = file.read()
+        file_size = len(file_content)
 
-        with open(file_path, 'wb') as f:
-            f.write(file_data)
+        result = supabase.storage.from_(BUCKET_NAME).upload(
+            path=storage_path,
+            file=file_content,
+            file_options={"content-type": mime_type}
+        )
 
-        # Construire l'URL du fichier
-        base_url = event.get('headers', {}).get('host', '')
-        protocol = 'https://' if 'netlify.app' in base_url or 'ae2i' in base_url else 'http://'
-        file_url = f"{protocol}{base_url}/uploads/{unique_filename}"
+        public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(storage_path)
 
-        # Log de succès
-        print(f"[SUCCESS] File uploaded: {unique_filename} ({file_size} bytes)")
+        uploaded_at = datetime.utcnow().isoformat() + 'Z'
 
-        # Retourner le succès
+        log_data = {
+            "id": str(uuid.uuid4()),
+            "created_at": uploaded_at,
+            "original_filename": original_filename,
+            "unique_filename": unique_filename,
+            "file_type": mime_type,
+            "size": file_size,
+            "category": category,
+            "public_url": public_url,
+            "storage_path": storage_path,
+            "status": "success",
+            "error_message": None
+        }
+
+        try:
+            supabase.table('media_uploads').insert(log_data).execute()
+        except Exception as log_error:
+            logger.warning(f"Erreur de journalisation (upload réussi): {str(log_error)}")
+
         return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-            },
-            'body': json.dumps({
-                'status': 'success',
-                'file_url': file_url,
-                'filename': unique_filename,
-                'size': file_size,
-                'message': 'File uploaded successfully'
-            })
+            "success": True,
+            "message": "Fichier uploadé avec succès",
+            "public_url": public_url,
+            "storage_path": storage_path,
+            "file_type": mime_type,
+            "uploaded_at": uploaded_at
         }
 
     except Exception as e:
-        # Log de l'erreur
-        print(f"[ERROR] Upload failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        error_message = str(e)
+        logger.error(f"Erreur upload: {error_message}")
 
-        return error_response(500, f'Internal server error: {str(e)}')
+        try:
+            supabase.table('media_uploads').insert({
+                "id": str(uuid.uuid4()),
+                "created_at": datetime.utcnow().isoformat() + 'Z',
+                "original_filename": file.filename if file else "unknown",
+                "status": "error",
+                "error_message": error_message
+            }).execute()
+        except:
+            pass
+
+        return {
+            "success": False,
+            "error": error_message
+        }
 
 
-def error_response(status_code, message):
+@upload_bp.route('/upload-file', methods=['POST'])
+def upload_file():
     """
-    Génère une réponse d'erreur standardisée
+    Upload d'un fichier unique
     """
-    print(f"[ERROR {status_code}] {message}")
+    if not supabase:
+        return jsonify({"success": False, "error": "Service Supabase non disponible"}), 503
 
-    return {
-        'statusCode': status_code,
-        'headers': {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-        },
-        'body': json.dumps({
-            'status': 'error',
-            'message': message
-        })
-    }
+    if 'file' not in request.files:
+        return jsonify({"success": False, "error": "Aucun fichier fourni"}), 400
+
+    file = request.files['file']
+    category = request.form.get('category')
+
+    result = upload_to_supabase(file, category)
+
+    status_code = 200 if result.get('success') else 400
+    return jsonify(result), status_code
+
+
+@upload_bp.route('/upload-multiple', methods=['POST'])
+def upload_multiple():
+    """
+    Upload de plusieurs fichiers
+    """
+    if not supabase:
+        return jsonify({"success": False, "error": "Service Supabase non disponible"}), 503
+
+    if 'files' not in request.files:
+        return jsonify({"success": False, "error": "Aucun fichier fourni"}), 400
+
+    files = request.files.getlist('files')
+    category = request.form.get('category')
+
+    results = []
+    success_count = 0
+    error_count = 0
+
+    for file in files:
+        result = upload_to_supabase(file, category)
+        results.append(result)
+
+        if result.get('success'):
+            success_count += 1
+        else:
+            error_count += 1
+
+    return jsonify({
+        "success": error_count == 0,
+        "message": f"{success_count} fichier(s) uploadé(s), {error_count} erreur(s)",
+        "total": len(files),
+        "success_count": success_count,
+        "error_count": error_count,
+        "results": results
+    }), 200
+
+
+@upload_bp.route('/list-files', methods=['GET'])
+def list_files():
+    """
+    Liste les fichiers d'un dossier spécifique
+    """
+    if not supabase:
+        return jsonify({"success": False, "error": "Service Supabase non disponible"}), 503
+
+    folder = request.args.get('folder', '')
+
+    try:
+        files = supabase.storage.from_(BUCKET_NAME).list(folder)
+
+        file_list = []
+        for file in files:
+            if file.get('name'):
+                storage_path = f"{folder}/{file['name']}" if folder else file['name']
+                public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(storage_path)
+
+                file_list.append({
+                    "name": file['name'],
+                    "storage_path": storage_path,
+                    "public_url": public_url,
+                    "size": file.get('metadata', {}).get('size'),
+                    "created_at": file.get('created_at'),
+                    "updated_at": file.get('updated_at')
+                })
+
+        return jsonify({
+            "success": True,
+            "folder": folder,
+            "count": len(file_list),
+            "files": file_list
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Erreur listage fichiers: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@upload_bp.route('/delete-file', methods=['DELETE'])
+def delete_file():
+    """
+    Supprime un fichier via son storage_path
+    """
+    if not supabase:
+        return jsonify({"success": False, "error": "Service Supabase non disponible"}), 503
+
+    data = request.get_json()
+
+    if not data or 'storage_path' not in data:
+        return jsonify({"success": False, "error": "storage_path requis"}), 400
+
+    storage_path = data['storage_path']
+
+    try:
+        supabase.storage.from_(BUCKET_NAME).remove([storage_path])
+
+        logger.info(f"Fichier supprimé: {storage_path}")
+
+        return jsonify({
+            "success": True,
+            "message": "deleted",
+            "storage_path": storage_path
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Erreur suppression: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@upload_bp.route('/upload-stats', methods=['GET'])
+def upload_stats():
+    """
+    Retourne des statistiques sur les uploads
+    """
+    if not supabase:
+        return jsonify({"success": False, "error": "Service Supabase non disponible"}), 503
+
+    try:
+        response = supabase.table('media_uploads').select('*').execute()
+
+        total_uploads = len(response.data)
+        success_uploads = len([r for r in response.data if r.get('status') == 'success'])
+        error_uploads = total_uploads - success_uploads
+
+        total_size = sum([r.get('size', 0) for r in response.data if r.get('size')])
+
+        types_count = {}
+        for record in response.data:
+            file_type = record.get('file_type', 'unknown')
+            types_count[file_type] = types_count.get(file_type, 0) + 1
+
+        categories_count = {}
+        for record in response.data:
+            category = record.get('category', 'unknown')
+            categories_count[category] = categories_count.get(category, 0) + 1
+
+        return jsonify({
+            "success": True,
+            "stats": {
+                "total_uploads": total_uploads,
+                "success_uploads": success_uploads,
+                "error_uploads": error_uploads,
+                "total_size_bytes": total_size,
+                "total_size_mb": round(total_size / (1024 * 1024), 2),
+                "file_types": types_count,
+                "categories": categories_count
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Erreur stats: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@upload_bp.route('/upload-health', methods=['GET'])
+def upload_health():
+    """
+    Vérifie la santé du service
+    """
+    supabase_connected = False
+    bucket_exists = False
+    table_exists = False
+
+    try:
+        if supabase:
+            buckets = supabase.storage.list_buckets()
+            supabase_connected = True
+            bucket_exists = any(b.name == BUCKET_NAME for b in buckets)
+
+            try:
+                supabase.table('media_uploads').select('id').limit(1).execute()
+                table_exists = True
+            except:
+                table_exists = False
+    except Exception as e:
+        logger.error(f"Health check error: {str(e)}")
+
+    status = "ok" if (supabase_connected and bucket_exists) else "degraded"
+
+    return jsonify({
+        "status": status,
+        "supabase_connected": supabase_connected,
+        "bucket_exists": bucket_exists,
+        "table_exists": table_exists,
+        "bucket_name": BUCKET_NAME,
+        "timestamp": datetime.utcnow().isoformat() + 'Z'
+    }), 200 if status == "ok" else 503
